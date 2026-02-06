@@ -7,164 +7,113 @@ const FEISHU_CONFIG = {
     table_id: 'tblm28fM4Gtsf1IU' 
 };
 
-/**
- * 获取飞书访问令牌
- */
-async function getTenantAccessToken() {
-    const response = await fetch('https://open.feishu.cn/open-api/auth/v3/tenant_access_token/internal', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            app_id: FEISHU_CONFIG.app_id,
-            app_secret: FEISHU_CONFIG.app_secret
-        })
-    });
-    
-    const data = await response.json();
-    
-    if (data.code !== 0) {
-        throw new Error('获取access_token失败: ' + data.msg);
-    }
-    
-    return data.tenant_access_token;
+// --- 自动清洗函数 (专治各种复制粘贴错误) ---
+function clean(str) {
+    if (!str) return '';
+    // 移除 URL 参数(?及后面)、Markdown符号、空格、换行
+    return str.split('?')[0].split('&')[0].replace(/\[|\]|\(|\)| /g, '').trim();
 }
 
-/**
- * 根据记录ID获取记录详情
- */
-async function getRecordById(recordId, accessToken) {
-    const url = `https://open.feishu.cn/open-api/bitable/v1/apps/${FEISHU_CONFIG.app_token}/tables/${FEISHU_CONFIG.table_id}/records/${recordId}`;
-    
-    const response = await fetch(url, {
-        method: 'GET',
-        headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-        }
-    });
-    
-    const data = await response.json();
-    
-    if (data.code !== 0) {
-        throw new Error('获取记录失败: ' + data.msg);
-    }
-    
-    return data.data.record;
-}
+const FEISHU_CONFIG = {
+    app_id: clean(CONFIG_RAW.app_id),
+    app_secret: clean(CONFIG_RAW.app_secret),
+    app_token: clean(CONFIG_RAW.app_token),
+    table_id: clean(CONFIG_RAW.table_id)
+};
 
-/**
- * Vercel Serverless函数入口
- */
-export default async function handler(req, res) {
-    // 设置CORS
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
-    // 处理OPTIONS预检请求
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
+// 辅助：安全的 Fetch 请求
+async function safeFetch(url, options, stepName) {
+    console.log(`[${stepName}] 请求 URL: ${url}`);
+    const response = await fetch(url, options);
+    const text = await response.text(); // 先取文本，防止 JSON 解析挂掉
+
+    if (!response.ok) {
+        throw new Error(`[${stepName}] HTTP错误 ${response.status}: ${text.substring(0, 100)}...`);
     }
-    
-    // 只接受GET请求
-    if (req.method !== 'GET') {
-        return res.status(405).json({ error: '只支持GET请求' });
-    }
-    
+
     try {
-        // 获取记录ID
-        const recordId = req.query.rid;
-        
-        if (!recordId) {
-            return res.status(400).json({ 
-                error: '缺少记录ID参数',
-                success: false
-            });
+        const json = JSON.parse(text);
+        if (json.code !== 0) {
+            throw new Error(`[${stepName}] 飞书API报错 (Code ${json.code}): ${json.msg}`);
         }
+        return json;
+    } catch (e) {
+        // 如果不是 JSON，说明返回了 HTML 错误页（通常是 ID 填错了导致 404）
+        throw new Error(`[${stepName}] 返回了非 JSON 数据 (可能是 URL 拼写错误): ${text.substring(0, 50)}...`);
+    }
+}
+
+export default async function handler(req, res) {
+    // CORS 配置
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    if (req.method === 'OPTIONS') return res.status(200).end();
+
+    try {
+        const recordId = clean(req.query.rid);
+        if (!recordId) return res.status(400).json({ error: '缺少 rid 参数', success: false });
+
+        // 1. 获取 Access Token
+        const tokenUrl = 'https://open.feishu.cn/open-api/auth/v3/tenant_access_token/internal';
+        const tokenData = await safeFetch(tokenUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ app_id: FEISHU_CONFIG.app_id, app_secret: FEISHU_CONFIG.app_secret })
+        }, '获取Token');
         
-        // 1. 获取访问令牌
-        const accessToken = await getTenantAccessToken();
-        
+        const accessToken = tokenData.tenant_access_token;
+
         // 2. 获取记录详情
-        const record = await getRecordById(recordId, accessToken);
+        // 确保 URL 没有多余的斜杠或字符
+        const recordUrl = `https://open.feishu.cn/open-api/bitable/v1/apps/${FEISHU_CONFIG.app_token}/tables/${FEISHU_CONFIG.table_id}/records/${recordId}`;
+        const recordRes = await safeFetch(recordUrl, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${accessToken}` }
+        }, '获取记录');
+
+        const record = recordRes.data.record;
         
-        // 3. 提取需要的字段
-        const studentName = record.fields['学生姓名'] || '未知学生';
-        const questionsJson = record.fields['AI出题结果'];
-        
-        if (!questionsJson) {
-            return res.status(404).json({
-                error: '该记录没有题目数据',
-                success: false
-            });
-        }
-        
-        // 4. 解析题目数据
+        // 3. 解析 AI 数据
+        let questionsJson = record.fields['AI出题结果'];
+        if (!questionsJson) throw new Error('找到记录了，但"AI出题结果"这一列是空的！');
+
         let questions = null;
-        
+        let innerContent = "";
+
+        // 强力解析逻辑
         try {
-            // 先解析一次（可能是字符串）
-            let data = questionsJson;
-            if (typeof data === 'string') {
-                data = JSON.parse(data);
-            }
-            
-            // 判断数据格式
-            if (data.output && data.output.choices && data.output.choices[0]) {
-                // DeepSeek API完整返回格式
-                const content = data.output.choices[0].message.content;
-                questions = JSON.parse(content);
-            } else if (Array.isArray(data)) {
-                // 已经是题目数组
-                questions = data;
-            } else if (data.questions && Array.isArray(data.questions)) {
-                // 包含questions字段
-                questions = data.questions;
+            let parsedRaw = (typeof questionsJson === 'string') ? JSON.parse(questionsJson) : questionsJson;
+            // 兼容 DeepSeek 结构和直接数组结构
+            if (parsedRaw.output && parsedRaw.output.choices) {
+                innerContent = parsedRaw.output.choices[0].message.content;
             } else {
-                // 尝试正则提取
-                const jsonString = typeof questionsJson === 'string' ? questionsJson : JSON.stringify(questionsJson);
-                const match = jsonString.match(/\[\s*\{.*\}\s*\]/s);
-                if (match) {
-                    questions = JSON.parse(match[0]);
-                }
+                innerContent = (typeof questionsJson === 'string') ? questionsJson : JSON.stringify(questionsJson);
             }
-        } catch (parseError) {
-            console.error('解析错误:', parseError);
-            return res.status(500).json({
-                error: '题目数据格式错误: ' + parseError.message,
-                success: false,
-                debug: {
-                    dataType: typeof questionsJson,
-                    dataPreview: typeof questionsJson === 'string' ? questionsJson.substring(0, 200) : JSON.stringify(questionsJson).substring(0, 200)
-                }
-            });
+            // 正则提取数组
+            const match = innerContent.match(/\[\s*\{.*\}\s*\]/s);
+            questions = match ? JSON.parse(match[0]) : JSON.parse(innerContent);
+        } catch (e) {
+            throw new Error(`AI数据解析失败: ${e.message}. 原始数据前50字: ${String(questionsJson).substring(0,50)}`);
         }
-        
-        if (!questions || !Array.isArray(questions) || questions.length === 0) {
-            return res.status(500).json({
-                error: '题目数据为空或格式错误',
-                success: false
-            });
-        }
-        
-        // 5. 返回数据
+
         return res.status(200).json({
             success: true,
-            data: {
-                studentName: studentName,
-                recordId: recordId,
-                questions: questions,
-                totalQuestions: questions.length
+            data: { 
+                studentName: record.fields['学生姓名'] || '未知',
+                questions: questions
             }
         });
-        
+
     } catch (error) {
-        console.error('API错误:', error);
+        // 返回详细的错误信息，不再显示奇怪的 Position 4
         return res.status(500).json({ 
-            error: '服务器错误: ' + error.message,
-            success: false
+            error: error.message, 
+            config_check: {
+                app_id_len: FEISHU_CONFIG.app_id ? FEISHU_CONFIG.app_id.length : 0,
+                token_len: FEISHU_CONFIG.app_token ? FEISHU_CONFIG.app_token.length : 0,
+                table_len: FEISHU_CONFIG.table_id ? FEISHU_CONFIG.table_id.length : 0
+            },
+            success: false 
         });
     }
 }
