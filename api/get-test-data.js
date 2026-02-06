@@ -10,7 +10,7 @@ const FEISHU_CONFIG = {
     app_id: 'cli_a9f232801c389cc8',           // 飞书应用ID
     app_secret: 'LE5aYm8IABsEPxeiQPZUyh3RMJPaYGVq',   // 飞书应用密钥
     app_token: 'Zj9VbXd86adTS3sWAaocizp1nxe',     // 多维表格app_token
-    table_id: 'tblm28fM4Gtsf1IU&view=vewxwuhsZ6'        // 数据表table_id
+    table_id: 'tblm28fM4Gtsf1IU'        // 数据表table_id
 };
 
 /**
