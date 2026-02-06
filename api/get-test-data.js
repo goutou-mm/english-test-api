@@ -1,48 +1,35 @@
 // 文件名: api/get-test-data.js
-
-// 1. 引入必要的工具
-import { URL } from 'url';
+// 1. 移除冗余的URL导入（未使用），改用CommonJS风格（适配Vercel Node环境）
+// const { URL } = require('url'); // 若未使用可直接删除
 
 // ===== 配置区域 (请在这里填入你的真实信息) =====
-const CONFIG_RAW = {
+const CONFIG = {
     // 你的飞书 App ID (cli_开头)
     app_id: 'cli_a9f232801c389cc8', 
-    
     // 你的 App Secret
     app_secret: 'LE5aYm8IABsEPxeiQPZUyh3RMJPaYGVq',
-    
     // 你的多维表格 Token (base开头, 在浏览器地址栏找)
     app_token: 'Zj9VbXd86adTS3sWAaocizp1nxe',
-    
     // 你的数据表 ID (tbl开头, 在浏览器地址栏找)
     table_id: 'tblm28fM4Gtsf1IU'
 };
 
-// --- 工具函数：清洗配置项 (自动去掉空格、括号、链接符号) ---
-function clean(str) {
+// --- 工具函数：仅清洗用户传入的rid参数（配置项不清洗） ---
+function cleanRecordId(str) {
     if (!str) return '';
-    // 移除 Markdown 链接格式、URL参数、空格、换行
-    return str.replace(/\[.*?\]\(.*?\)/g, '$1') // 尝试提取markdown链接文本
+    // 仅清洗rid参数：移除空格、特殊符号、URL参数干扰
+    return str.replace(/\s+/g, '')
               .split('?')[0]
               .split('&')[0]
-              .replace(/['"\[\]\(\)\s]/g, '') // 去掉引号、括号、空格
               .trim();
 }
-
-// 生成清洗后的配置
-const FEISHU_CONFIG = {
-    app_id: clean(CONFIG_RAW.app_id),
-    app_secret: clean(CONFIG_RAW.app_secret),
-    app_token: clean(CONFIG_RAW.app_token),
-    table_id: clean(CONFIG_RAW.table_id)
-};
 
 // --- 工具函数：安全的 Fetch 请求 ---
 async function safeFetch(url, options, stepName) {
     console.log(`[${stepName}] 请求: ${url}`);
     try {
         const response = await fetch(url, options);
-        const text = await response.text(); // 先取文本，防止 JSON 解析挂掉
+        const text = await response.text(); 
 
         if (!response.ok) {
             throw new Error(`[${stepName}] HTTP错误 ${response.status}: ${text.substring(0, 200)}`);
@@ -50,14 +37,14 @@ async function safeFetch(url, options, stepName) {
 
         try {
             const json = JSON.parse(text);
-            if (json.code !== 0) {
+            // 飞书API正常返回code为0，特殊处理token接口（返回的是tenant_access_token，无code）
+            if (json.code !== undefined && json.code !== 0) {
                 throw new Error(`[${stepName}] 飞书API报错 (Code ${json.code}): ${json.msg}`);
             }
             return json;
         } catch (e) {
             if (e.message.includes('飞书API报错')) throw e;
-            // 如果不是 JSON，说明返回了 HTML 错误页
-            throw new Error(`[${stepName}] 返回了非 JSON 数据 (可能是 URL 拼写错误): ${text.substring(0, 100)}...`);
+            throw new Error(`[${stepName}] 返回了非 JSON 数据: ${text.substring(0, 100)}...`);
         }
     } catch (error) {
         throw new Error(`网络请求失败 (${stepName}): ${error.message}`);
@@ -66,7 +53,7 @@ async function safeFetch(url, options, stepName) {
 
 // --- 主处理函数 ---
 export default async function handler(req, res) {
-    // 1. 设置跨域 (CORS) - 允许任何网站访问此接口
+    // 1. 设置跨域 (CORS)
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -75,58 +62,70 @@ export default async function handler(req, res) {
     if (req.method === 'OPTIONS') return res.status(200).end();
 
     try {
-        // 2. 获取记录 ID
-        const recordId = clean(req.query.rid);
-        if (!recordId) return res.status(400).json({ error: '请在URL中提供 rid 参数 (例如: ?rid=recXXXX)', success: false });
+        // 2. 获取并清洗记录 ID（仅清洗rid，配置项不洗）
+        const recordId = cleanRecordId(req.query.rid);
+        if (!recordId) return res.status(400).json({ 
+            error: '请在URL中提供 rid 参数 (例如: ?rid=recXXXX)', 
+            success: false 
+        });
 
-        // 3. 获取 Access Token
-        const tokenUrl = 'https://open.feishu.cn/open-api/auth/v3/tenant_access_token/internal';
+        // 3. 获取 Access Token（修复路径：open-apis 而非 open-api）
+        const tokenUrl = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal';
         const tokenData = await safeFetch(tokenUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ app_id: FEISHU_CONFIG.app_id, app_secret: FEISHU_CONFIG.app_secret })
+            body: JSON.stringify({ 
+                app_id: CONFIG.app_id, 
+                app_secret: CONFIG.app_secret 
+            })
         }, '获取Token');
         
         const accessToken = tokenData.tenant_access_token;
+        if (!accessToken) throw new Error('获取到的Token为空，请检查飞书App权限');
 
-        // 4. 获取记录详情
-        const recordUrl = `https://open.feishu.cn/open-api/bitable/v1/apps/${FEISHU_CONFIG.app_token}/tables/${FEISHU_CONFIG.table_id}/records/${recordId}`;
+        // 4. 获取记录详情（修复路径：open-apis 而非 open-api）
+        const recordUrl = `https://open.feishu.cn/open-apis/bitable/v1/apps/${CONFIG.app_token}/tables/${CONFIG.table_id}/records/${recordId}`;
         const recordRes = await safeFetch(recordUrl, {
             method: 'GET',
             headers: { 'Authorization': `Bearer ${accessToken}` }
         }, '获取记录');
 
         const record = recordRes.data.record;
+        if (!record) throw new Error('飞书返回记录为空，请检查recordId是否正确');
         
-        // 5. 解析 AI 数据
+        // 5. 解析 AI 数据（增加兜底逻辑）
         let questionsJson = record.fields['AI出题结果'];
-        if (!questionsJson) throw new Error('找到记录了，但"AI出题结果"这一列是空的！请检查飞书表格是否已生成内容。');
+        if (!questionsJson) throw new Error('找到记录了，但"AI出题结果"这一列是空的！');
 
         let questions = null;
         let innerContent = "";
 
-        // 智能解析逻辑
         try {
-            // 尝试把字段内容当做字符串解析
-            let parsedRaw = (typeof questionsJson === 'string') ? JSON.parse(questionsJson) : questionsJson;
-            
-            // 兼容 DeepSeek 结构
+            // 第一步：标准化原始数据
+            const rawStr = typeof questionsJson === 'string' ? questionsJson : JSON.stringify(questionsJson);
+            // 第二步：兼容 DeepSeek 结构
+            const parsedRaw = JSON.parse(rawStr);
             if (parsedRaw.output && parsedRaw.output.choices) {
-                innerContent = parsedRaw.output.choices[0].message.content;
+                innerContent = parsedRaw.output.choices[0].message.content.trim();
             } else {
-                innerContent = (typeof questionsJson === 'string') ? questionsJson : JSON.stringify(questionsJson);
+                innerContent = rawStr.trim();
             }
             
-            // 提取 JSON 数组 [ ... ]
-            const match = innerContent.match(/\[\s*\{.*\}\s*\]/s);
-            if (match) {
+            // 第三步：提取JSON数组（增加兜底）
+            const match = innerContent.match(/\[\s*\{[\s\S]*\}\s*\]/); // 优化正则匹配
+            if (match && match[0]) {
                 questions = JSON.parse(match[0]);
             } else {
-                // 如果没有数组结构，尝试直接解析
+                // 兜底：尝试直接解析（若本身就是数组）
                 questions = JSON.parse(innerContent);
             }
+
+            // 校验：确保是数组
+            if (!Array.isArray(questions)) {
+                throw new Error('解析结果不是JSON数组');
+            }
         } catch (e) {
-            throw new Error(`AI数据解析失败: ${e.message}. 原始数据前50字: ${String(questionsJson).substring(0,50)}`);
+            throw new Error(`AI数据解析失败: ${e.message}. 原始数据前100字: ${String(questionsJson).substring(0, 100)}`);
         }
 
         // 6. 返回成功结果
@@ -140,13 +139,14 @@ export default async function handler(req, res) {
         });
 
     } catch (error) {
-        // 7. 返回错误信息 (不再是 500 崩溃，而是明确的 JSON 错误)
-        console.error(error);
+        // 7. 错误返回（保留调试信息）
+        console.error('全局错误:', error);
         return res.status(500).json({ 
             error: error.message, 
-            debug_config: {
-                app_id_check: FEISHU_CONFIG.app_id ? "已填" : "未填",
-                token_check: FEISHU_CONFIG.app_token ? "已填" : "未填"
+            debug_info: {
+                record_id: req.query.rid,
+                app_id_configured: !!CONFIG.app_id,
+                app_token_configured: !!CONFIG.app_token
             },
             success: false 
         });
