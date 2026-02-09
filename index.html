@@ -428,7 +428,7 @@
                     
                     // ===== 从API读取题目数据 =====
                     // TODO: 替换为你部署的Vercel地址
-                    const apiUrl = 'https://english-test-api.vercel.app/api/get-test-data';
+                    const apiUrl = '/api/get-test-data';
                     const response = await fetch(`${apiUrl}?rid=${recordId}`);
                     
                     if (!response.ok) {
